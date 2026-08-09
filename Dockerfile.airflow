@@ -1,0 +1,13 @@
+FROM apache/airflow:2.9.3
+
+# On utilise le fichier de contraintes officiel d'Airflow (correspondant à la version
+# d'Airflow ET à la version de Python de l'image) pour garantir que pandas, scikit-learn
+# et mlflow s'installent avec des versions compatibles avec Airflow et ses fournisseurs
+# (ça évite le conflit cryptography / pyOpenSSL qu'on a eu avec _PIP_ADDITIONAL_REQUIREMENTS)
+
+RUN pip install --no-cache-dir \
+    pandas \
+    scikit-learn \
+    mlflow \
+    xgboost \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.12.txt"

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+env/
+
+# Airflow
+logs/
+airflow.db
+airflow-webserver.pid
+
+# MLflow (le dossier data/mlruns est volumineux et généré automatiquement,
+# pas besoin de le versionner avec Git ni DVC)
+data/mlruns/
+mlruns/
+mlflow.db
+
+# Fichiers intermédiaires régénérés automatiquement à chaque run du DAG
+data/processed/
+
+# Fichiers de debug
+scheduler_logs.txt
+
+# Dataset brut original (découpé en initial_data.csv / new_data.csv, gérés par DVC)
+data/raw/creditcard.csv
+
+# Secrets / config locale
+.env
+
+# Éditeurs
+.vscode/
+.idea/
+
+# Système
+.DS_Store
+Thumbs.db
