@@ -3,14 +3,16 @@ API FastAPI pour la détection de fraude bancaire.
 
 Charge le modèle exporté par Airflow (model.pkl) et expose un endpoint /predict
 qui reçoit une transaction et retourne une prédiction (fraude ou non) avec sa
-probabilité.
+probabilité. Expose aussi /metrics pour le monitoring Prometheus.
 """
 
 import json
+import time
 import joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI(
     title="API de détection de fraude bancaire",
@@ -26,6 +28,31 @@ FEATURE_COLUMNS_PATH = "/app/model/feature_columns.json"
 model = None
 feature_columns = None
 
+# --- Métriques Prometheus ---
+# Compteur : combien de prédictions au total, ventilées par résultat (fraude/normale)
+# -> permet de suivre le TAUX de fraude détecté dans le temps sur un graphique Grafana
+predictions_total = Counter(
+    "fraud_predictions_total",
+    "Nombre total de prédictions effectuées, par résultat",
+    ["label"]
+)
+
+# Histogramme : distribution du temps de réponse de /predict
+# -> permet de vérifier le respect de l'exigence "< 200ms" du cahier des charges
+prediction_latency = Histogram(
+    "fraud_prediction_latency_seconds",
+    "Temps de traitement d'une prédiction (secondes)"
+)
+
+# Histogramme : distribution des probabilités de fraude retournées
+# -> utile pour repérer une DÉRIVE : si le modèle se met à retourner des probabilités
+# très différentes de d'habitude, c'est un signal que les données ont changé (data drift)
+prediction_probability = Histogram(
+    "fraud_prediction_probability",
+    "Distribution des probabilités de fraude prédites",
+    buckets=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+)
+
 
 @app.on_event("startup")
 def charger_modele():
@@ -34,6 +61,12 @@ def charger_modele():
     with open(FEATURE_COLUMNS_PATH) as f:
         feature_columns = json.load(f)
     print(f"Modèle chargé avec succès ({len(feature_columns)} colonnes attendues)")
+
+
+@app.get("/metrics")
+def metrics():
+    """Endpoint que Prometheus vient interroger périodiquement pour collecter les métriques."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 class Transaction(BaseModel):
@@ -112,6 +145,8 @@ def predict(transaction: Transaction):
     if model is None:
         raise HTTPException(status_code=503, detail="Modèle non chargé")
 
+    debut = time.time()
+
     # On convertit la transaction en DataFrame avec les colonnes dans le MÊME ordre
     # que celui utilisé à l'entraînement (crucial pour la fiabilité de la prédiction)
     donnees = pd.DataFrame([transaction.dict()])
@@ -119,9 +154,15 @@ def predict(transaction: Transaction):
 
     prediction = int(model.predict(donnees)[0])
     probabilite = float(model.predict_proba(donnees)[0][1])  # probabilité de la classe "fraude"
+    label = "fraude" if prediction == 1 else "normale"
+
+    # Enregistrement des métriques pour Prometheus/Grafana
+    predictions_total.labels(label=label).inc()
+    prediction_probability.observe(probabilite)
+    prediction_latency.observe(time.time() - debut)
 
     return PredictionResponse(
         prediction=prediction,
-        label="fraude" if prediction == 1 else "normale",
+        label=label,
         probabilite_fraude=round(probabilite, 4),
     )
