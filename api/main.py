@@ -147,9 +147,16 @@ def predict(transaction: Transaction):
 
     debut = time.time()
 
-    # On convertit la transaction en DataFrame avec les colonnes dans le MÊME ordre
-    # que celui utilisé à l'entraînement (crucial pour la fiabilité de la prédiction)
+    # On convertit la transaction en DataFrame
     donnees = pd.DataFrame([transaction.dict()])
+
+    # Le modèle a été entraîné avec une feature "Hour" dérivée de Time (découverte de
+    # l'EDA : le taux de fraude varie fortement selon l'heure) -> on la calcule ici de
+    # la même façon que dans preprocess_data, pour rester cohérent avec l'entraînement
+    donnees['Hour'] = (donnees['Time'] // 3600) % 24
+
+    # On réordonne les colonnes dans le MÊME ordre que celui utilisé à l'entraînement
+    # (crucial pour la fiabilité de la prédiction)
     donnees = donnees[feature_columns]
 
     prediction = int(model.predict(donnees)[0])

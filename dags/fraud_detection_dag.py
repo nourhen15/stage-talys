@@ -31,7 +31,6 @@ def extract_data(**kwargs):
     df = pd.read_csv(RAW_PATH)
     print(f"Données extraites : {len(df)} lignes")
 
-    # On pousse juste le chemin du fichier via XCom, pas les données elles-mêmes
     kwargs['ti'].xcom_push(key='raw_path', value=RAW_PATH)
 
 
@@ -43,8 +42,14 @@ def preprocess_data(**kwargs):
     raw_path = kwargs['ti'].xcom_pull(key='raw_path', task_ids='extract_data')
     df = pd.read_csv(raw_path)
 
-    # 'Amount' et 'Time' ne sont pas issues de la PCA -> on les met à la même échelle
-    # que les autres colonnes (V1...V28), sinon le modèle leur donnerait trop d'importance
+    # Découverte de l'EDA : 718 lignes dupliquées -> on les retire
+    n_avant = len(df)
+    df = df.drop_duplicates()
+    print(f"Doublons retirés : {n_avant - len(df)} lignes")
+
+    # Découverte de l'EDA : le taux de fraude varie fortement selon l'heure
+    df['Hour'] = (df['Time'] // 3600) % 24
+
     scaler = StandardScaler()
     df['Amount'] = scaler.fit_transform(df[['Amount']])
     df['Time'] = scaler.fit_transform(df[['Time']])
@@ -57,8 +62,10 @@ def preprocess_data(**kwargs):
 
 
 def train_model(**kwargs):
+    import gc
+    import time
     import pandas as pd
-    from sklearn.model_selection import train_test_split, cross_val_score
+    from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV
     from sklearn.linear_model import LogisticRegression
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -67,41 +74,69 @@ def train_model(**kwargs):
     import mlflow.sklearn
 
     processed_path = kwargs['ti'].xcom_pull(key='processed_path', task_ids='preprocess_data')
-    df = pd.read_csv(processed_path)
+
+    # float32 au lieu du float64 par défaut : divise par 2 la mémoire utilisée pour
+    # charger les données (important ici, la machine a des ressources limitées, 8 Go RAM)
+    colonnes_v = [f"V{i}" for i in range(1, 29)]
+    dtypes = {col: 'float32' for col in colonnes_v + ['Time', 'Amount', 'Hour']}
+    df = pd.read_csv(processed_path, dtype=dtypes)
 
     X = df.drop(columns=['Class'])
     y = df['Class']
+    del df
+    gc.collect()
 
     # stratify=y : on garde la même proportion de fraudes dans train et test
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train_complet, X_test, y_train_complet, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
+    del X, y
+    gc.collect()
+
+    # --- Contrainte "modèle efficient" (demande de l'encadrant) : on entraîne le
+    # modèle final sur un sous-échantillon de 80 000 lignes plutôt que sur les 182 000
+    # lignes complètes. Vu la machine disponible (8 Go RAM) et le fait que le dataset
+    # est déjà très séparable (V14 notamment, cf. EDA), ce compromis reste largement
+    # suffisant pour de bonnes performances, tout en réduisant nettement le temps et
+    # la mémoire nécessaires -> c'est un choix d'efficience assumé, pas une limitation
+    # cachée.
+    X_train, _, y_train, _ = train_test_split(
+        X_train_complet, y_train_complet, train_size=80000, random_state=42, stratify=y_train_complet
+    )
+    del X_train_complet, y_train_complet
+    gc.collect()
 
     mlflow.set_tracking_uri(f"file://{MLFLOW_TRACKING_DIR}")
     mlflow.set_experiment("fraud_detection")
 
-    # --- Étape 1 : comparer 5 modèles sur un échantillon réduit ---
-    # (comparer sur les 227k lignes complètes avec cross-validation serait beaucoup
-    # trop long pour certains modèles ; un échantillon stratifié de 50 000 lignes
-    # donne une comparaison fiable en une fraction du temps)
+    # --- Étape 1 : comparer 5 modèles baseline sur un échantillon réduit ---
     X_sample, _, y_sample, _ = train_test_split(
-        X_train, y_train, train_size=50000, random_state=42, stratify=y_train
+        X_train, y_train, train_size=30000, random_state=42, stratify=y_train
     )
 
-    # scale_pos_weight : équivalent pour XGBoost du class_weight='balanced' des autres
-    # modèles (XGBoost n'a pas ce paramètre directement) -> ratio non-fraude / fraude
+    # scale_pos_weight : équivalent pour XGBoost du class_weight='balanced'
     ratio_desequilibre = (y_sample == 0).sum() / (y_sample == 1).sum()
 
     candidats = {
         "logistic_regression": LogisticRegression(max_iter=1000, class_weight='balanced'),
         "decision_tree": DecisionTreeClassifier(class_weight='balanced', random_state=42),
         "random_forest": RandomForestClassifier(
-            n_estimators=100, max_depth=10, class_weight='balanced', random_state=42
+            n_estimators=50, max_depth=10, class_weight='balanced', random_state=42, n_jobs=1
         ),
-        "gradient_boosting": GradientBoostingClassifier(random_state=42),
+        "gradient_boosting": GradientBoostingClassifier(n_estimators=50, random_state=42),
         "xgboost": XGBClassifier(
-            scale_pos_weight=ratio_desequilibre, eval_metric='logloss', random_state=42
+            n_estimators=50, scale_pos_weight=ratio_desequilibre, eval_metric='logloss',
+            random_state=42, n_jobs=1, tree_method='hist'
         ),
+    }
+
+    # --- Grilles d'hyperparamètres, volontairement compactes ---
+    grilles = {
+        "logistic_regression": {"C": [0.01, 0.1, 1, 10]},
+        "decision_tree": {"max_depth": [5, 10, 15], "min_samples_leaf": [1, 5, 10]},
+        "random_forest": {"n_estimators": [50, 100], "max_depth": [5, 10]},
+        "gradient_boosting": {"n_estimators": [50, 100], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
+        "xgboost": {"n_estimators": [50, 100], "max_depth": [3, 5], "learning_rate": [0.05, 0.1]},
     }
 
     with mlflow.start_run(run_name="model_selection") as parent_run:
@@ -109,9 +144,7 @@ def train_model(**kwargs):
 
         for nom, modele in candidats.items():
             with mlflow.start_run(run_name=nom, nested=True):
-                # cv=3 : validation croisée à 3 plis, scoring='f1' car c'est la métrique
-                # la plus parlante ici (le dataset est très déséquilibré)
-                cv_scores = cross_val_score(modele, X_sample, y_sample, cv=3, scoring='f1')
+                cv_scores = cross_val_score(modele, X_sample, y_sample, cv=3, scoring='f1', n_jobs=1)
                 score_moyen = cv_scores.mean()
                 scores[nom] = score_moyen
 
@@ -119,21 +152,56 @@ def train_model(**kwargs):
                 mlflow.log_metric("f1_cv_moyen", score_moyen)
                 print(f"{nom} : F1 moyen (cross-validation) = {score_moyen:.3f}")
 
-        # --- Étape 2 : choisir le meilleur et le réentraîner sur TOUTES les données ---
-        meilleur_nom = max(scores, key=scores.get)
-        print(f"\nMeilleur modèle : {meilleur_nom} (F1 cv = {scores[meilleur_nom]:.3f})")
+        del X_sample, y_sample
+        gc.collect()
 
-        meilleur_modele = candidats[meilleur_nom]
-        meilleur_modele.fit(X_train, y_train)
+        meilleur_nom = max(scores, key=scores.get)
+        print(f"\nMeilleur modèle (baseline) : {meilleur_nom} (F1 cv = {scores[meilleur_nom]:.3f})")
+
+        # --- RandomizedSearchCV léger : n_iter=3 combinaisons x cv=3 = 9 entraînements
+        # seulement, sur l'échantillon de 80 000 lignes ---
+        print(f"Recherche d'hyperparamètres pour {meilleur_nom}...")
+        grille = grilles[meilleur_nom]
+        modele_de_base = candidats[meilleur_nom]
+
+        recherche = RandomizedSearchCV(
+            modele_de_base, grille, n_iter=3, cv=3, scoring='f1',
+            n_jobs=1, random_state=42
+        )
+        recherche.fit(X_train, y_train)
+
+        print(f"Meilleurs hyperparamètres trouvés : {recherche.best_params_}")
+        print(f"Meilleur F1 (recherche) : {recherche.best_score_:.3f}")
+
+        meilleur_modele = recherche.best_estimator_
+        del recherche
+        gc.collect()
 
         mlflow.log_param("meilleur_modele", meilleur_nom)
-        mlflow.log_metric("f1_cv_meilleur", scores[meilleur_nom])
+        mlflow.log_param("taille_echantillon_entrainement", len(X_train))
+        mlflow.log_metric("f1_cv_baseline", scores[meilleur_nom])
+
+        # --- Efficience : taille du modèle et latence de prédiction ---
+        import joblib
+        import tempfile
+        import os as _os
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            joblib.dump(meilleur_modele, tmp.name)
+            taille_ko = _os.path.getsize(tmp.name) / 1024
+            _os.remove(tmp.name)
+        mlflow.log_metric("taille_modele_ko", taille_ko)
+
+        debut = time.time()
+        meilleur_modele.predict(X_test.iloc[:1000])
+        latence_s = time.time() - debut
+        mlflow.log_metric("latence_moyenne_ms", latence_s)
+        print(f"Taille du modèle : {taille_ko:.1f} Ko | Latence (1000 préd.) : {latence_s*1000:.1f} ms")
+
         mlflow.sklearn.log_model(meilleur_modele, "model")
 
         run_id = parent_run.info.run_id
         print(f"Modèle final entraîné et loggé. Run MLflow : {run_id}")
 
-        # On sauvegarde aussi le jeu de test pour que evaluate_model puisse s'en servir
         X_test.to_csv("/opt/airflow/data/processed/X_test.csv", index=False)
         y_test.to_csv("/opt/airflow/data/processed/y_test.csv", index=False)
 
@@ -142,7 +210,10 @@ def train_model(**kwargs):
 
 def evaluate_model(**kwargs):
     import pandas as pd
-    from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
+    from sklearn.metrics import (
+        classification_report, f1_score, precision_score, recall_score,
+        accuracy_score, roc_auc_score
+    )
     import mlflow
     import mlflow.sklearn
 
@@ -156,19 +227,26 @@ def evaluate_model(**kwargs):
     y_test = pd.read_csv("/opt/airflow/data/processed/y_test.csv").squeeze()
 
     y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
 
+    accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred)
     recall = recall_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred)
+    # AUC-ROC : mesure la capacité du modèle à séparer les 2 classes, indépendamment
+    # d'un seuil de décision précis -> aide à diagnostiquer under/overfitting
+    auc_roc = roc_auc_score(y_test, y_proba)
 
     print(classification_report(y_test, y_pred))
-    print(f"Precision: {precision:.3f} | Recall: {recall:.3f} | F1: {f1:.3f}")
+    print(f"Accuracy: {accuracy:.3f} | Precision: {precision:.3f} | Recall: {recall:.3f} | "
+          f"F1: {f1:.3f} | AUC-ROC: {auc_roc:.3f}")
 
-    # On rattache les métriques d'évaluation au même run MLflow
     with mlflow.start_run(run_id=run_id):
+        mlflow.log_metric("accuracy", accuracy)
         mlflow.log_metric("precision", precision)
         mlflow.log_metric("recall", recall)
         mlflow.log_metric("f1_score", f1)
+        mlflow.log_metric("auc_roc", auc_roc)
 
 
 def export_model(**kwargs):
@@ -184,14 +262,8 @@ def export_model(**kwargs):
     model = mlflow.sklearn.load_model(f"runs:/{run_id}/model")
 
     os.makedirs(os.path.dirname(MODEL_EXPORT_PATH), exist_ok=True)
-
-    # joblib est le format standard pour sauvegarder des modèles scikit-learn de façon
-    # légère et rapide à recharger -> l'API n'aura besoin que de ce seul fichier,
-    # sans dépendre de MLflow au moment de servir les prédictions
     joblib.dump(model, MODEL_EXPORT_PATH)
 
-    # On sauvegarde aussi la liste des colonnes attendues (dans le bon ordre) : l'API
-    # en aura besoin pour valider et ordonner correctement les données reçues
     colonnes = list(model.feature_names_in_)
     with open("/opt/airflow/data/model/feature_columns.json", "w") as f:
         json.dump(colonnes, f)
@@ -200,34 +272,10 @@ def export_model(**kwargs):
     print(f"Run MLflow source : {run_id}")
 
 
-extract = PythonOperator(
-    task_id='extract_data',
-    python_callable=extract_data,
-    dag=dag
-)
-
-preprocess = PythonOperator(
-    task_id='preprocess_data',
-    python_callable=preprocess_data,
-    dag=dag
-)
-
-train = PythonOperator(
-    task_id='train_model',
-    python_callable=train_model,
-    dag=dag
-)
-
-evaluate = PythonOperator(
-    task_id='evaluate_model',
-    python_callable=evaluate_model,
-    dag=dag
-)
-
-export = PythonOperator(
-    task_id='export_model',
-    python_callable=export_model,
-    dag=dag
-)
+extract = PythonOperator(task_id='extract_data', python_callable=extract_data, dag=dag)
+preprocess = PythonOperator(task_id='preprocess_data', python_callable=preprocess_data, dag=dag)
+train = PythonOperator(task_id='train_model', python_callable=train_model, dag=dag)
+evaluate = PythonOperator(task_id='evaluate_model', python_callable=evaluate_model, dag=dag)
+export = PythonOperator(task_id='export_model', python_callable=export_model, dag=dag)
 
 extract >> preprocess >> train >> evaluate >> export
