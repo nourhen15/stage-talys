@@ -11,3 +11,16 @@ RUN pip install --no-cache-dir \
     mlflow \
     xgboost \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.12.txt"
+
+# PyTorch CPU uniquement : l'index officiel --index-url ci-dessous ne contient QUE
+# des builds CPU (pas de CUDA/GPU), contrairement à l'installation par défaut sur
+# PyPI qui embarque des centaines de Mo de dépendances GPU inutiles ici (même
+# problème qu'on avait eu avec xgboost et nvidia-nccl-cu12)
+RUN pip install --no-cache-dir --timeout=180 --retries=10 \
+    torch --index-url https://download.pytorch.org/whl/cpu
+
+# ctgan : génère des données tabulaires synthétiques (utilisé ici pour créer des
+# transactions frauduleuses synthétiques et rééquilibrer l'entraînement). Installé
+# après torch pour que pip réutilise la version CPU déjà en place plutôt que d'en
+# retélécharger une autre.
+RUN pip install --no-cache-dir --timeout=180 --retries=10 ctgan==0.10.2

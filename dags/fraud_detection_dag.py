@@ -14,7 +14,9 @@ dag = DAG(
     'fraud_detection_pipeline',
     default_args=default_args,
     description='Pipeline ML pour la détection de fraude bancaire',
-    schedule_interval=None,  # Déclenchement manuel uniquement (pas de run automatique quotidien)
+    # Déclenchement manuel uniquement : un schedule automatique (@daily) ajouterait
+    # une charge régulière que la machine (8 Go RAM) ne supporte pas confortablement
+    schedule_interval=None,
     catchup=False
 )
 
@@ -53,6 +55,50 @@ def preprocess_data(**kwargs):
     scaler = StandardScaler()
     df['Amount'] = scaler.fit_transform(df[['Amount']])
     df['Time'] = scaler.fit_transform(df[['Time']])
+
+    # On sauvegarde des statistiques de référence (moyenne/écart-type des features
+    # les plus discriminantes, cf. EDA) pour permettre au DAG de surveillance de la
+    # dérive (drift_monitoring_dag.py) de détecter un changement dans les futures
+    # données, en les comparant à cette référence
+    import json
+    features_surveillees = ['V14', 'V4', 'V12', 'V10', 'V17', 'Amount']
+    stats_reference = {
+        col: {"moyenne": float(df[col].mean()), "ecart_type": float(df[col].std())}
+        for col in features_surveillees
+    }
+    os.makedirs("/opt/airflow/data/monitoring", exist_ok=True)
+    with open("/opt/airflow/data/monitoring/reference_stats.json", "w") as f:
+        json.dump(stats_reference, f, indent=2)
+    print("Statistiques de référence sauvegardées pour la détection de dérive")
+
+    # --- Génération de fraudes synthétiques avec CTGAN (demande de l'encadrant) ---
+    # On entraîne le GAN UNIQUEMENT sur les transactions frauduleuses (peu nombreuses,
+    # ~400 lignes) -> beaucoup plus léger que d'entraîner sur tout le dataset, puisque
+    # le but est justement d'apprendre à quoi ressemble UNE fraude pour en générer
+    # d'autres, pas d'apprendre tout le dataset.
+    from ctgan import CTGAN
+
+    colonnes_numeriques = [c for c in df.columns if c not in ('Class',)]
+    df_fraudes = df[df['Class'] == 1][colonnes_numeriques]
+    print(f"Entraînement du CTGAN sur {len(df_fraudes)} transactions frauduleuses...")
+
+    # epochs volontairement bas (défaut CTGAN = 300) : suffisant pour un premier
+    # résultat exploitable, tout en restant raisonnable en temps/mémoire sur une
+    # machine aux ressources limitées
+    gan = CTGAN(epochs=100, batch_size=100, verbose=False)
+    gan.fit(df_fraudes)
+
+    # On génère autant de fraudes synthétiques que de vraies fraudes -> double le
+    # nombre d'exemples de fraude disponibles pour l'entraînement, sans pour autant
+    # sur-représenter artificiellement la classe minoritaire
+    n_synthetiques = len(df_fraudes)
+    fraudes_synthetiques = gan.sample(n_synthetiques)
+    fraudes_synthetiques['Class'] = 1
+    print(f"{n_synthetiques} fraudes synthétiques générées")
+
+    df = pd.concat([df, fraudes_synthetiques], ignore_index=True)
+    print(f"Dataset après ajout des fraudes synthétiques : {len(df)} lignes "
+          f"({df['Class'].sum()} fraudes au total)")
 
     os.makedirs(os.path.dirname(PROCESSED_PATH), exist_ok=True)
     df.to_csv(PROCESSED_PATH, index=False)
