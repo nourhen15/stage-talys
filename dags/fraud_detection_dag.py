@@ -1,5 +1,6 @@
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
 from datetime import datetime, timedelta
 
 default_args = {
@@ -22,18 +23,62 @@ dag = DAG(
 
 # Chemins partagés (correspondent au volume ./data:/opt/airflow/data)
 RAW_PATH = "/opt/airflow/data/raw/initial_data.csv"
+NEW_DATA_PATH = "/opt/airflow/data/raw/new_data.csv"
 PROCESSED_PATH = "/opt/airflow/data/processed/processed_data.csv"
 MLFLOW_TRACKING_DIR = "/opt/airflow/data/mlruns"
 MODEL_EXPORT_PATH = "/opt/airflow/data/model/model.pkl"
+SCALER_EXPORT_PATH = "/opt/airflow/data/model/preprocessing_scaler.pkl"
 
 
 def extract_data(**kwargs):
     import pandas as pd
 
-    df = pd.read_csv(RAW_PATH)
-    print(f"Données extraites : {len(df)} lignes")
+    # Permet de distinguer un run manuel d'un retraining déclenché par le
+    # DAG de monitoring lorsqu'une dérive est détectée
+    dag_run = kwargs.get("dag_run")
 
-    kwargs['ti'].xcom_push(key='raw_path', value=RAW_PATH)
+    use_new_data = (
+        dag_run
+        and dag_run.conf
+        and dag_run.conf.get("use_new_data", False)
+    )
+
+    if use_new_data:
+        df_initial = pd.read_csv(RAW_PATH)
+        df_new = pd.read_csv(NEW_DATA_PATH)
+
+        # On combine les données historiques avec les nouvelles données
+        # pour effectuer un véritable retraining
+        df = pd.concat(
+            [df_initial, df_new],
+            ignore_index=True
+        )
+
+        retraining_path = "/opt/airflow/data/raw/retraining_data.csv"
+
+        df.to_csv(
+            retraining_path,
+            index=False
+        )
+
+        print(
+            f"Retraining avec initial_data + new_data : "
+            f"{len(df)} lignes"
+        )
+
+        kwargs['ti'].xcom_push(
+            key='raw_path',
+            value=retraining_path
+        )
+
+    else:
+        df = pd.read_csv(RAW_PATH)
+        print(f"Données extraites : {len(df)} lignes")
+
+        kwargs['ti'].xcom_push(
+            key='raw_path',
+            value=RAW_PATH
+        )
 
 
 def preprocess_data(**kwargs):
@@ -52,24 +97,54 @@ def preprocess_data(**kwargs):
     # Découverte de l'EDA : le taux de fraude varie fortement selon l'heure
     df['Hour'] = (df['Time'] // 3600) % 24
 
-    scaler = StandardScaler()
-    df['Amount'] = scaler.fit_transform(df[['Amount']])
-    df['Time'] = scaler.fit_transform(df[['Time']])
-
-    # On sauvegarde des statistiques de référence (moyenne/écart-type des features
-    # les plus discriminantes, cf. EDA) pour permettre au DAG de surveillance de la
-    # dérive (drift_monitoring_dag.py) de détecter un changement dans les futures
-    # données, en les comparant à cette référence
+    # On sauvegarde les statistiques de référence AVANT le scaling.
+    # Cela permet de comparer les futures données brutes avec les données
+    # de référence brutes dans le DAG de surveillance de la dérive.
     import json
+
+    # On utilise initial_data comme référence stable pour le monitoring,
+    # même lorsqu'un retraining est déclenché avec new_data.
+    df_reference = pd.read_csv(RAW_PATH)
+    df_reference = df_reference.drop_duplicates()
+
     features_surveillees = ['V14', 'V4', 'V12', 'V10', 'V17', 'Amount']
+
     stats_reference = {
-        col: {"moyenne": float(df[col].mean()), "ecart_type": float(df[col].std())}
+        col: {
+            "moyenne": float(df_reference[col].mean()),
+            "ecart_type": float(df_reference[col].std())
+        }
         for col in features_surveillees
     }
+
     os.makedirs("/opt/airflow/data/monitoring", exist_ok=True)
+
     with open("/opt/airflow/data/monitoring/reference_stats.json", "w") as f:
         json.dump(stats_reference, f, indent=2)
+
     print("Statistiques de référence sauvegardées pour la détection de dérive")
+
+    # Le scaler est entraîné sur les données utilisées pour ce run.
+    # Il sera sauvegardé puis réutilisé par FastAPI afin d'appliquer
+    # exactement la même transformation aux données reçues en production.
+    scaler = StandardScaler()
+
+    df[['Amount', 'Time']] = scaler.fit_transform(
+        df[['Amount', 'Time']]
+    )
+
+    os.makedirs("/opt/airflow/data/model", exist_ok=True)
+
+    import joblib
+
+    joblib.dump(
+        scaler,
+        SCALER_EXPORT_PATH
+    )
+
+    print(
+        f"Scaler sauvegardé : {SCALER_EXPORT_PATH}"
+    )
 
     # --- Génération de fraudes synthétiques avec CTGAN (demande de l'encadrant) ---
     # On entraîne le GAN UNIQUEMENT sur les transactions frauduleuses (peu nombreuses,
@@ -294,6 +369,48 @@ def evaluate_model(**kwargs):
         mlflow.log_metric("f1_score", f1)
         mlflow.log_metric("auc_roc", auc_roc)
 
+    # Les métriques sont envoyées via XCom afin que la tâche de validation
+    # puisse décider si le modèle peut être exporté.
+    kwargs['ti'].xcom_push(
+        key='f1_score',
+        value=float(f1)
+    )
+
+    kwargs['ti'].xcom_push(
+        key='recall',
+        value=float(recall)
+    )
+
+
+def validate_model(**kwargs):
+    ti = kwargs['ti']
+
+    f1 = ti.xcom_pull(
+        key='f1_score',
+        task_ids='evaluate_model'
+    )
+
+    recall = ti.xcom_pull(
+        key='recall',
+        task_ids='evaluate_model'
+    )
+
+    # Seuils minimums de validation du modèle
+    MIN_F1 = 0.75
+    MIN_RECALL = 0.75
+
+    print(
+        f"Validation du modèle : "
+        f"F1={f1:.3f} | Recall={recall:.3f}"
+    )
+
+    if f1 >= MIN_F1 and recall >= MIN_RECALL:
+        print("✅ Modèle validé")
+        return "export_model"
+
+    print("❌ Modèle rejeté : performances insuffisantes")
+    return "reject_model"
+
 
 def export_model(**kwargs):
     import joblib
@@ -310,11 +427,19 @@ def export_model(**kwargs):
     os.makedirs(os.path.dirname(MODEL_EXPORT_PATH), exist_ok=True)
     joblib.dump(model, MODEL_EXPORT_PATH)
 
+    # On vérifie que le scaler généré pendant le preprocessing existe avant
+    # d'autoriser l'export du modèle.
+    if not os.path.exists(SCALER_EXPORT_PATH):
+        raise FileNotFoundError(
+            f"Scaler introuvable : {SCALER_EXPORT_PATH}"
+        )
+
     colonnes = list(model.feature_names_in_)
     with open("/opt/airflow/data/model/feature_columns.json", "w") as f:
         json.dump(colonnes, f)
 
     print(f"Modèle exporté vers {MODEL_EXPORT_PATH}")
+    print(f"Scaler exporté vers {SCALER_EXPORT_PATH}")
     print(f"Run MLflow source : {run_id}")
 
 
@@ -322,6 +447,22 @@ extract = PythonOperator(task_id='extract_data', python_callable=extract_data, d
 preprocess = PythonOperator(task_id='preprocess_data', python_callable=preprocess_data, dag=dag)
 train = PythonOperator(task_id='train_model', python_callable=train_model, dag=dag)
 evaluate = PythonOperator(task_id='evaluate_model', python_callable=evaluate_model, dag=dag)
+
+validate = BranchPythonOperator(
+    task_id='validate_model',
+    python_callable=validate_model,
+    dag=dag
+)
+
 export = PythonOperator(task_id='export_model', python_callable=export_model, dag=dag)
 
-extract >> preprocess >> train >> evaluate >> export
+reject = EmptyOperator(
+    task_id='reject_model',
+    dag=dag
+)
+
+
+extract >> preprocess >> train >> evaluate >> validate
+
+validate >> export
+validate >> reject
