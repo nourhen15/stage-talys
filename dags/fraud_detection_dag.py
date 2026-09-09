@@ -3,6 +3,7 @@ from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
 from datetime import datetime, timedelta
 
+
 default_args = {
     'owner': 'nourhen',
     'depends_on_past': False,
@@ -193,6 +194,7 @@ def train_model(**kwargs):
     from xgboost import XGBClassifier
     import mlflow
     import mlflow.sklearn
+    from mlflow.models import infer_signature
 
     processed_path = kwargs['ti'].xcom_pull(key='processed_path', task_ids='preprocess_data')
 
@@ -317,8 +319,22 @@ def train_model(**kwargs):
         latence_s = time.time() - debut
         mlflow.log_metric("latence_moyenne_ms", latence_s)
         print(f"Taille du modèle : {taille_ko:.1f} Ko | Latence (1000 préd.) : {latence_s*1000:.1f} ms")
+        
+        signature = infer_signature(
+            X_train,
+            meilleur_modele.predict(X_train)
+        )
 
-        mlflow.sklearn.log_model(meilleur_modele, "model")
+        input_example = X_train.iloc[:2]
+
+        mlflow.sklearn.log_model(
+            meilleur_modele,
+            "model",
+            registered_model_name="fraud_detection_model",
+            signature=signature,
+            input_example=input_example,
+        )
+        
 
         run_id = parent_run.info.run_id
         print(f"Modèle final entraîné et loggé. Run MLflow : {run_id}")

@@ -153,6 +153,8 @@ services:
   airflow-worker:
     <<: *airflow-common
     command: celery worker
+    ports:
+      - "5000:5000"
     healthcheck:
       # yamllint disable rule:line-length
       test:
@@ -288,8 +290,17 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml
     restart: unless-stopped
 
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    restart: unless-stopped
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: cadvisor

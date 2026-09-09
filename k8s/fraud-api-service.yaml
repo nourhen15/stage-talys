@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-api-service
+spec:
+  selector:
+    app: fraud-api
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  # NodePort : expose l'API sur un port accessible depuis ton PC (en dehors du
+  # cluster), pratique pour tester avec le navigateur comme on le faisait avec
+  # Docker Compose
+  type: NodePort

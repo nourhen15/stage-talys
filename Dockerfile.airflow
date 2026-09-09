@@ -8,10 +8,9 @@ FROM apache/airflow:2.9.3
 RUN pip install --no-cache-dir \
     pandas \
     scikit-learn \
-    mlflow \
+    "mlflow>=3.2.0,<3.3.0" \
     xgboost \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.12.txt"
-
 # PyTorch CPU uniquement : l'index officiel --index-url ci-dessous ne contient QUE
 # des builds CPU (pas de CUDA/GPU), contrairement à l'installation par défaut sur
 # PyPI qui embarque des centaines de Mo de dépendances GPU inutiles ici (même
