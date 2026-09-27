@@ -1,0 +1,20 @@
+FROM apache/airflow:2.9.3
+
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openjdk-17-jdk-headless curl procps && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+RUN curl -fsSL https://archive.apache.org/dist/spark/spark-3.5.8/spark-3.5.8-bin-hadoop3.tgz -o /tmp/spark.tgz && \
+    tar -xzf /tmp/spark.tgz -C /opt && \
+    mv /opt/spark-3.5.8-bin-hadoop3 /opt/spark && \
+    rm /tmp/spark.tgz && \
+    chown -R 50000:0 /opt/spark    # <-- AJOUTÉ : donne la propriété à l'utilisateur airflow (UID 50000)
+
+ENV SPARK_HOME=/opt/spark
+ENV PATH=$PATH:$SPARK_HOME/bin
+
+ENTRYPOINT []
+USER airflow

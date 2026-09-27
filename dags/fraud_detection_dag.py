@@ -86,25 +86,62 @@ def preprocess_data(**kwargs):
     import pandas as pd
     from sklearn.preprocessing import StandardScaler
     import os
-
-    raw_path = kwargs['ti'].xcom_pull(key='raw_path', task_ids='extract_data')
-    df = pd.read_csv(raw_path)
-
-    # Découverte de l'EDA : 718 lignes dupliquées -> on les retire
-    n_avant = len(df)
-    df = df.drop_duplicates()
-    print(f"Doublons retirés : {n_avant - len(df)} lignes")
-
-    # Découverte de l'EDA : le taux de fraude varie fortement selon l'heure
-    df['Hour'] = (df['Time'] // 3600) % 24
-
-    # On sauvegarde les statistiques de référence AVANT le scaling.
-    # Cela permet de comparer les futures données brutes avec les données
-    # de référence brutes dans le DAG de surveillance de la dérive.
     import json
 
-    # On utilise initial_data comme référence stable pour le monitoring,
-    # même lorsqu'un retraining est déclenché avec new_data.
+    raw_path = kwargs['ti'].xcom_pull(key='raw_path', task_ids='extract_data')
+
+    # --- Traitement distribué : Spark + HDFS ---
+    # Le nettoyage (doublons, feature Hour) est délégué à un cluster Spark
+    # (Kubernetes) plutôt que fait en pandas local, avec écriture du résultat
+    # sur HDFS comme preuve du traitement distribué.
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+    from pyspark import SparkContext
+
+    # Sécurité : Celery réutilise parfois le même processus Python entre
+    # plusieurs exécutions de tâches (mode prefork) -> un ancien
+    # SparkContext arrêté peut encore traîner en mémoire et bloquer la
+    # création d'une nouvelle SparkSession. On force un nettoyage avant.
+    if SparkContext._active_spark_context is not None:
+        SparkContext._active_spark_context.stop()
+        SparkContext._active_spark_context = None
+    SparkSession._instantiatedSession = None
+    SparkContext._jvm = None
+    SparkContext._gateway = None
+
+    spark = SparkSession.builder \
+        .appName('fraud_preprocess') \
+        .master('spark://spark-master:7077') \
+        .config('spark.executor.memory', '2g') \
+        .getOrCreate()
+
+    df_brut = pd.read_csv(raw_path)
+    df_spark = spark.createDataFrame(df_brut)
+    del df_brut
+
+    # Découverte de l'EDA : 718 lignes dupliquées -> on les retire (via Spark)
+    n_avant = df_spark.count()
+    df_spark = df_spark.dropDuplicates()
+    n_apres = df_spark.count()
+    print(f"Doublons retirés (Spark) : {n_avant - n_apres} lignes")
+
+    # Découverte de l'EDA : le taux de fraude varie fortement selon l'heure
+    df_spark = df_spark.withColumn('Hour', ((F.col('Time') / 3600) % 24).cast('int'))
+
+    # Écriture sur HDFS : preuve du traitement distribué, consultable dans
+    # l'UI HDFS ou via `hdfs dfs -ls` en soutenance
+    hdfs_output_path = "hdfs://namenode:8020/fraud_pipeline/processed_data.parquet"
+    df_spark.write.mode('overwrite').parquet(hdfs_output_path)
+    print(f"Données nettoyées écrites sur HDFS : {hdfs_output_path}")
+
+    # Retour direct en pandas pour la suite du pipeline (CTGAN, scaling...)
+    df = df_spark.toPandas()
+    spark.stop()
+    print(f"Données récupérées depuis Spark : {len(df)} lignes")
+    # --- Suite inchangée : statistiques de référence, scaler, CTGAN ---
+
+    import json
+
     df_reference = pd.read_csv(RAW_PATH)
     df_reference = df_reference.drop_duplicates()
 
@@ -125,9 +162,6 @@ def preprocess_data(**kwargs):
 
     print("Statistiques de référence sauvegardées pour la détection de dérive")
 
-    # Le scaler est entraîné sur les données utilisées pour ce run.
-    # Il sera sauvegardé puis réutilisé par FastAPI afin d'appliquer
-    # exactement la même transformation aux données reçues en production.
     scaler = StandardScaler()
 
     df[['Amount', 'Time']] = scaler.fit_transform(
@@ -143,30 +177,17 @@ def preprocess_data(**kwargs):
         SCALER_EXPORT_PATH
     )
 
-    print(
-        f"Scaler sauvegardé : {SCALER_EXPORT_PATH}"
-    )
+    print(f"Scaler sauvegardé : {SCALER_EXPORT_PATH}")
 
-    # --- Génération de fraudes synthétiques avec CTGAN (demande de l'encadrant) ---
-    # On entraîne le GAN UNIQUEMENT sur les transactions frauduleuses (peu nombreuses,
-    # ~400 lignes) -> beaucoup plus léger que d'entraîner sur tout le dataset, puisque
-    # le but est justement d'apprendre à quoi ressemble UNE fraude pour en générer
-    # d'autres, pas d'apprendre tout le dataset.
     from ctgan import CTGAN
 
     colonnes_numeriques = [c for c in df.columns if c not in ('Class',)]
     df_fraudes = df[df['Class'] == 1][colonnes_numeriques]
     print(f"Entraînement du CTGAN sur {len(df_fraudes)} transactions frauduleuses...")
 
-    # epochs volontairement bas (défaut CTGAN = 300) : suffisant pour un premier
-    # résultat exploitable, tout en restant raisonnable en temps/mémoire sur une
-    # machine aux ressources limitées
     gan = CTGAN(epochs=100, batch_size=100, verbose=False)
     gan.fit(df_fraudes)
 
-    # On génère autant de fraudes synthétiques que de vraies fraudes -> double le
-    # nombre d'exemples de fraude disponibles pour l'entraînement, sans pour autant
-    # sur-représenter artificiellement la classe minoritaire
     n_synthetiques = len(df_fraudes)
     fraudes_synthetiques = gan.sample(n_synthetiques)
     fraudes_synthetiques['Class'] = 1
@@ -432,6 +453,7 @@ def export_model(**kwargs):
     import joblib
     import mlflow
     import mlflow.sklearn
+    from mlflow import MlflowClient
     import os
     import json
 
@@ -454,10 +476,27 @@ def export_model(**kwargs):
     with open("/opt/airflow/data/model/feature_columns.json", "w") as f:
         json.dump(colonnes, f)
 
+    # --- Promotion dans le MLflow Model Registry ---
+    # On retrouve la version du modèle enregistrée pour ce run précis, et on
+    # lui attribue l'alias "production" -> l'API saura toujours quelle
+    # version charger, même après plusieurs réentraînements.
+    client = MlflowClient()
+    versions = client.search_model_versions(f"run_id='{run_id}'")
+
+    if versions:
+        version_num = versions[0].version
+        client.set_registered_model_alias(
+            name="fraud_detection_model",
+            alias="production",
+            version=version_num
+        )
+        print(f"Alias 'production' attribué à la version {version_num} du modèle")
+    else:
+        print("⚠️ Aucune version de modèle trouvée pour ce run_id dans le Registry")
+
     print(f"Modèle exporté vers {MODEL_EXPORT_PATH}")
     print(f"Scaler exporté vers {SCALER_EXPORT_PATH}")
     print(f"Run MLflow source : {run_id}")
-
 
 extract = PythonOperator(task_id='extract_data', python_callable=extract_data, dag=dag)
 preprocess = PythonOperator(task_id='preprocess_data', python_callable=preprocess_data, dag=dag)

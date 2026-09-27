@@ -155,6 +155,8 @@ services:
     command: celery worker
     ports:
       - "5000:5000"
+      - "42000:42000"         # <-- AJOUTÉ (port du driver)
+      - "42001:42001"         # <-- AJOUTÉ (port du block manager)
     healthcheck:
       # yamllint disable rule:line-length
       test:
@@ -282,6 +284,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data/model:/app/model
+      - ./data/mlruns:/opt/airflow/data/mlruns    # <-- chemin identique à celui d'Airflow
     restart: unless-stopped
   prometheus:
     image: prom/prometheus:latest
@@ -290,17 +293,9 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml
     restart: unless-stopped
 
-  alertmanager:
-    image: prom/alertmanager:latest
-    container_name: alertmanager
-    ports:
-      - "9093:9093"
-    volumes:
-      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
-    restart: unless-stopped
+
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: cadvisor
@@ -322,6 +317,68 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
     restart: unless-stopped
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      - CLUSTER_NAME=fraud-cluster
+      - HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check=false
+    ports:
+      - "9870:9870"
+    volumes:
+      - namenode-data:/hadoop/dfs/name
+    restart: unless-stopped
+
+  datanode-1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode-1
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - SERVICE_PRECONDITION=namenode:9870
+    volumes:
+      - datanode1-data:/hadoop/dfs/data
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  datanode-2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode-2
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - SERVICE_PRECONDITION=namenode:9870
+    volumes:
+      - datanode2-data:/hadoop/dfs/data
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "0.0.0.0"]
+    ports:
+      - "7077:7077"
+      - "4040:8080"
+    restart: unless-stopped
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=1
+    depends_on:
+      - spark-master
+    restart: unless-stopped
 volumes:
   postgres-db-volume:
   grafana-data:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:

@@ -1,9 +1,10 @@
 """
 API FastAPI pour la détection de fraude bancaire.
 
-Charge le modèle exporté par Airflow (model.pkl), le scaler utilisé pendant
-l'entraînement et expose un endpoint /predict qui reçoit une transaction et
-retourne une prédiction (fraude ou non) avec sa probabilité.
+Charge le modèle depuis le MLflow Model Registry (alias "production"),
+le scaler utilisé pendant l'entraînement, et expose un endpoint /predict
+qui reçoit une transaction et retourne une prédiction (fraude ou non)
+avec sa probabilité.
 
 Expose aussi /metrics pour le monitoring Prometheus.
 """
@@ -12,6 +13,8 @@ import json
 import time
 import joblib
 import pandas as pd
+import mlflow
+import mlflow.pyfunc
 
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -31,10 +34,12 @@ app = FastAPI(
 
 
 # ============================================================
-# FICHIERS DU MODÈLE
+# CONFIGURATION MLFLOW & FICHIERS
 # ============================================================
 
-MODEL_PATH = "/app/model/model.pkl"
+MLFLOW_TRACKING_DIR = "/opt/airflow/data/mlruns"
+MODEL_URI = "models:/fraud_detection_model@production"
+
 FEATURE_COLUMNS_PATH = "/app/model/feature_columns.json"
 SCALER_PATH = "/app/model/preprocessing_scaler.pkl"
 
@@ -91,8 +96,11 @@ def charger_modele():
     global model, feature_columns, scaler
 
     try:
-        # Chargement du modèle ML
-        model = joblib.load(MODEL_PATH)
+        # Chargement du modèle depuis le MLflow Model Registry, via l'alias
+        # "production" -> toujours la dernière version validée et exportée
+        # par le pipeline Airflow, pas un fichier .pkl figé.
+        mlflow.set_tracking_uri(f"file://{MLFLOW_TRACKING_DIR}")
+        model = mlflow.pyfunc.load_model(MODEL_URI)
 
         # Chargement de l'ordre des features
         with open(FEATURE_COLUMNS_PATH, "r") as f:
@@ -102,7 +110,7 @@ def charger_modele():
         scaler = joblib.load(SCALER_PATH)
 
         print(
-            f"Modèle chargé avec succès "
+            f"Modèle chargé depuis MLflow Registry ({MODEL_URI}) "
             f"({len(feature_columns)} colonnes attendues)"
         )
 
@@ -266,6 +274,7 @@ def health():
         "status": "ok",
         "modele_charge": True,
         "scaler_charge": True,
+        "source_modele": MODEL_URI,
     }
 
 
@@ -337,14 +346,15 @@ def predict(transaction: Transaction):
     # --------------------------------------------------------
     # 5. Prédiction
     # --------------------------------------------------------
+    # mlflow.pyfunc ne propose pas predict_proba() directement -> on accède
+    # au modèle scikit-learn brut sous le wrapper MLflow pour récupérer les
+    # probabilités, nécessaires pour retourner probabilite_fraude.
 
-    prediction = int(
-        model.predict(donnees)[0]
-    )
+    modele_sklearn = model._model_impl.sklearn_model
 
-    probabilite = float(
-        model.predict_proba(donnees)[0][1]
-    )
+    predictions_proba = modele_sklearn.predict_proba(donnees)
+    probabilite = float(predictions_proba[0][1])
+    prediction = int(probabilite >= 0.5)
 
     label = (
         "fraude"

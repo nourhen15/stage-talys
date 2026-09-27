@@ -1,25 +1,26 @@
 FROM apache/airflow:2.9.3
 
-# On utilise le fichier de contraintes officiel d'Airflow (correspondant à la version
-# d'Airflow ET à la version de Python de l'image) pour garantir que pandas, scikit-learn
-# et mlflow s'installent avec des versions compatibles avec Airflow et ses fournisseurs
-# (ça évite le conflit cryptography / pyOpenSSL qu'on a eu avec _PIP_ADDITIONAL_REQUIREMENTS)
+USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openjdk-17-jdk-headless procps && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+USER airflow
 
 RUN pip install --no-cache-dir \
     pandas \
     scikit-learn \
     "mlflow>=3.2.0,<3.3.0" \
     xgboost \
+    requests \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.12.txt"
-# PyTorch CPU uniquement : l'index officiel --index-url ci-dessous ne contient QUE
-# des builds CPU (pas de CUDA/GPU), contrairement à l'installation par défaut sur
-# PyPI qui embarque des centaines de Mo de dépendances GPU inutiles ici (même
-# problème qu'on avait eu avec xgboost et nvidia-nccl-cu12)
+
+# pyspark installé séparément, SANS le fichier de contraintes Airflow (qui pin
+# pyspark à 3.5.1) -> on veut 3.5.8 pour matcher exactement l'image spark:3.5.8
+# de nos manifests K8s.
+RUN pip install --no-cache-dir pyspark==3.5.8
+
 RUN pip install --no-cache-dir --timeout=180 --retries=10 \
     torch --index-url https://download.pytorch.org/whl/cpu
 
-# ctgan : génère des données tabulaires synthétiques (utilisé ici pour créer des
-# transactions frauduleuses synthétiques et rééquilibrer l'entraînement). Installé
-# après torch pour que pip réutilise la version CPU déjà en place plutôt que d'en
-# retélécharger une autre.
 RUN pip install --no-cache-dir --timeout=180 --retries=10 ctgan==0.10.2
